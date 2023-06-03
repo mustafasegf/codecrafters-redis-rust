@@ -1,6 +1,6 @@
 // Uncomment this block to pass the first stage
 use std::io::prelude::*;
-use std::io::BufReader;
+// use std::io::BufReader;
 use std::net::TcpListener;
 use std::net::TcpStream;
 
@@ -18,7 +18,7 @@ fn main() {
         match stream {
             Ok(stream) => {
                 println!("new client!");
-                if let Err(e) = handle_client(BufReader::new(stream)) {
+                if let Err(e) = handle_client(stream) {
                     println!("error: {}", e);
                 }
             }
@@ -29,17 +29,23 @@ fn main() {
     }
 }
 
-pub fn handle_client(mut stream: BufReader<TcpStream>) -> Result<()> {
-    let mut buf = String::with_capacity(1024);
+pub fn handle_client(mut stream: TcpStream) -> Result<()> {
+    let mut buf = vec![0; 512];
 
-    stream.read_line(&mut buf)?;
-    stream.read_line(&mut buf)?;
-    stream.read_line(&mut buf)?;
-
-    println!("received: {}", buf);
-
-    stream.get_mut().write_all(b"+PONG\r\n")?;
-
-    Ok(())
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                println!("client disconnected");
+                return Ok(());
+            },
+            Ok(n) => {
+                println!("read {} bytes", n);
+                stream.write(b"+PONG\r\n")?;
+            },
+            Err(e) => {
+                println!("error: {}", e);
+                return Ok(());
+            }
+        }
+    }
 }
-
