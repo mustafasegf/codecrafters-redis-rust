@@ -3,13 +3,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::BytesMut;
-// Uncomment this block to pass the first stage
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use anyhow::Result;
 use tokio::sync::Mutex;
 
+// TODO: add pub sub, add cluster, add persistence, add replication, add transaction, add set with
+// all options, add get with all options, add delete, add expire, add ttl, add persist
 #[derive(Debug)]
 pub enum Command {
     Echo(String),
@@ -276,22 +277,13 @@ pub async fn handle_client(
                     Command::Ping(s) => {
                         Value::SimpleString(s.or_else(|| Some("PONG".to_string())).unwrap())
                     }
-                    Command::Set(k, v, Some(exp)) => {
+                    Command::Set(k, v, exp) => {
                         db.lock().await.insert(
                             k,
                             ExpiringValue {
                                 value: v,
-                                expires_at: Some(SystemTime::now() + Duration::from_millis(exp)),
-                            },
-                        );
-                        Value::SimpleString("OK".to_string())
-                    }
-                    Command::Set(k, v, None) => {
-                        db.lock().await.insert(
-                            k,
-                            ExpiringValue {
-                                value: v,
-                                expires_at: None,
+                                expires_at: exp
+                                    .map(|exp| SystemTime::now() + Duration::from_millis(exp)),
                             },
                         );
                         Value::SimpleString("OK".to_string())
@@ -302,9 +294,7 @@ pub async fn handle_client(
                             expires_at: exp,
                         }) => exp
                             .and_then(|exp| match exp.duration_since(SystemTime::now()) {
-                                Ok(time) if time.as_millis() > 0 => {
-                                    Some(Value::BulkString(val.to_string()))
-                                }
+                                Ok(time) if time.as_millis() > 0 => None,
                                 _ => Some(Value::Null),
                             })
                             .unwrap_or(Value::BulkString(val.to_string())),
