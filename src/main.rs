@@ -1,47 +1,52 @@
 // Uncomment this block to pass the first stage
-use std::io::prelude::*;
-// use std::io::BufReader;
-use std::net::TcpListener;
-use std::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use anyhow::Result;
 
-fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
+#[tokio::main]
+async fn main() {
+    println!("Starting server...");
 
-    // Uncomment this block to pass the first stage
-    //
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let listener = match TcpListener::bind("127.0.0.1:6379").await {
+        Ok(listener) => listener,
+        Err(e) => {
+            println!("error binding socket: {}", e);
+            return;
+        }
+    };
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                println!("new client!");
-                if let Err(e) = handle_client(stream) {
+    loop {
+        let conn = listener.accept().await;
+        tokio::spawn(async move {
+            match conn {
+                Ok((stream, _)) => {
+                    println!("new client!");
+                    if let Err(e) = handle_client(stream).await {
+                        println!("error: {}", e);
+                    }
+                }
+                Err(e) => {
                     println!("error: {}", e);
                 }
             }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
+        });
     }
 }
 
-pub fn handle_client(mut stream: TcpStream) -> Result<()> {
+pub async fn handle_client(mut stream: TcpStream) -> Result<()> {
     let mut buf = vec![0; 512];
 
     loop {
-        match stream.read(&mut buf) {
+        match stream.read(&mut buf).await {
             Ok(0) => {
                 println!("client disconnected");
                 return Ok(());
-            },
+            }
             Ok(n) => {
                 println!("read {} bytes", n);
-                stream.write(b"+PONG\r\n")?;
-            },
+                stream.write(b"+PONG\r\n").await?;
+            }
             Err(e) => {
                 println!("error: {}", e);
                 return Ok(());
