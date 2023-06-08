@@ -1,14 +1,20 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use bytes::BytesMut;
 // Uncomment this block to pass the first stage
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use anyhow::Result;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub enum Command {
     Echo(String),
     Ping(Option<String>),
+    Set(String, String),
+    Get(String),
     Error(String),
     Unknown(String),
 }
@@ -20,37 +26,43 @@ pub enum Value {
     Integer(i64),
     BulkString(String),
     Array(Vec<Value>),
+    Null,
 }
 
 impl Value {
     pub fn to_command(&self) -> Command {
-        println!("to_command");
         println!("self: {:?}", self);
         match self {
-            Value::Array(items) => {
-                if let Value::BulkString(cmd) = &items[0] {
-                    match cmd.to_ascii_lowercase().as_str() {
-                        "ping" => {
-                            if let Some(Value::BulkString(msg)) = items.get(1) {
-                                Command::Ping(Some(msg.to_string()))
-                            } else {
-                                Command::Ping(None)
-                            }
+            Value::Array(items) => match items.get(0) {
+                Some(Value::BulkString(cmd)) => match cmd.to_ascii_lowercase().as_str() {
+                    "ping" => match items.get(1) {
+                        Some(Value::BulkString(msg)) => Command::Ping(Some(msg.to_string())),
+                        None => Command::Ping(None),
+                        _ => Command::Error("invalid command".to_string()),
+                    },
+                    "echo" => match items.get(1) {
+                        Some(Value::BulkString(msg)) => Command::Echo(msg.to_string()),
+                        _ => Command::Error("invalid command, need message".to_string()),
+                    },
+                    "set" => match (items.get(1), items.get(2)) {
+                        (Some(Value::BulkString(key)), Some(Value::BulkString(value))) => {
+                            Command::Set(key.to_string(), value.to_string())
                         }
-                        "echo" => {
-                            if let Some(Value::BulkString(msg)) = items.get(1) {
-                                Command::Echo(msg.to_string())
-                            } else {
-                                Command::Error("invalid command, need message".to_string())
-                            }
+                        (Some(Value::BulkString(_)), None) => {
+                            Command::Error("invalid command, need value".to_string())
                         }
-                        _ => Command::Unknown("unknown".to_string()),
-                    }
-                } else {
-                    Command::Unknown("unknown".to_string())
-                }
-            }
-            _ => Command::Unknown("unknown".to_string()),
+                        _ => Command::Error("invalid command, need key and value".to_string()),
+                    },
+                    "get" => match items.get(1) {
+                        Some(Value::BulkString(key)) => Command::Get(key.to_string()),
+                        _ => Command::Error("invalid command, need key".to_string()),
+                    },
+
+                    cmd => Command::Unknown(format!("unknown command: {}", cmd)),
+                },
+                _ => Command::Error("invalid command".to_string()),
+            },
+            _ => Command::Error("Error: Not Array".to_string()),
         }
     }
 }
@@ -62,6 +74,7 @@ impl ToString for Value {
             Value::Error(s) => format!("-{}\r\n", s),
             Value::Integer(i) => format!(":{}\r\n", i),
             Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
+            Value::Null => "$-1\r\n".to_string(),
             Value::Array(v) => {
                 let mut s = String::new();
                 s.push_str(&format!("*{}\r\n", v.len()));
@@ -165,6 +178,15 @@ pub fn parse_command(buf: BytesMut) -> Result<Option<(Value, usize)>> {
             }
             None => Ok(None),
         },
+        ':' => match readline(&buf[1..]) {
+            Some((line, len)) => {
+                let line = std::str::from_utf8(line)?;
+                let line = line.parse::<i64>()?;
+
+                Ok(Some((Value::Integer(line), len + 1)))
+            }
+            None => Ok(None),
+        },
         _ => Err(anyhow::anyhow!("unknown command")),
     }
 }
@@ -190,25 +212,33 @@ async fn main() {
         }
     };
 
+    let db: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
     loop {
         let conn = listener.accept().await;
-        tokio::spawn(async move {
-            match conn {
-                Ok((stream, _)) => {
-                    println!("new client!");
-                    if let Err(e) = handle_client(stream).await {
+        tokio::spawn({
+            let db = db.clone();
+            async move {
+                match conn {
+                    Ok((stream, _)) => {
+                        println!("new client!");
+                        if let Err(e) = handle_client(stream, db).await {
+                            println!("error: {}", e);
+                        }
+                    }
+                    Err(e) => {
                         println!("error: {}", e);
                     }
-                }
-                Err(e) => {
-                    println!("error: {}", e);
                 }
             }
         });
     }
 }
 
-pub async fn handle_client(stream: TcpStream) -> Result<()> {
+pub async fn handle_client(
+    stream: TcpStream,
+    db: Arc<Mutex<HashMap<String, String>>>,
+) -> Result<()> {
     let mut conn = Connection::new(stream);
 
     loop {
@@ -223,22 +253,20 @@ pub async fn handle_client(stream: TcpStream) -> Result<()> {
             }
             Ok(Some(value)) => {
                 let resp = match value.to_command() {
-                    Command::Echo(s) => {
-                        println!("echo");
-                        Value::SimpleString(s)
-                    }
+                    Command::Echo(s) => Value::SimpleString(s),
                     Command::Ping(s) => {
-                        println!("ping");
                         Value::SimpleString(s.or_else(|| Some("PONG".to_string())).unwrap())
                     }
-                    Command::Unknown(s) => {
-                        println!("unknown: {}", s);
-                        Value::Error("ERR unknown command".to_string())
+                    Command::Set(k, v) => {
+                        db.lock().await.insert(k, v);
+                        Value::SimpleString("OK".to_string())
                     }
-                    Command::Error(s) => {
-                        println!("error: {}", s);
-                        Value::Error(s)
-                    }
+                    Command::Get(k) => match db.lock().await.get(&k) {
+                        Some(v) => Value::BulkString(v.to_string()),
+                        None => Value::Null,
+                    },
+                    Command::Unknown(s) => Value::Error(s),
+                    Command::Error(s) => Value::Error(s),
                 };
                 conn.write(resp).await?;
             }
