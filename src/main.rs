@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use bytes::BytesMut;
 // Uncomment this block to pass the first stage
@@ -13,7 +14,7 @@ use tokio::sync::Mutex;
 pub enum Command {
     Echo(String),
     Ping(Option<String>),
-    Set(String, String),
+    Set(String, String, Option<u64>),
     Get(String),
     Error(String),
     Unknown(String),
@@ -44,11 +45,24 @@ impl Value {
                         Some(Value::BulkString(msg)) => Command::Echo(msg.to_string()),
                         _ => Command::Error("invalid command, need message".to_string()),
                     },
-                    "set" => match (items.get(1), items.get(2)) {
-                        (Some(Value::BulkString(key)), Some(Value::BulkString(value))) => {
-                            Command::Set(key.to_string(), value.to_string())
-                        }
-                        (Some(Value::BulkString(_)), None) => {
+                    "set" => match (items.get(1), items.get(2), items.get(3), items.get(4)) {
+                        (
+                            Some(Value::BulkString(key)),
+                            Some(Value::BulkString(value)),
+                            Some(Value::BulkString(cmd)),
+                            Some(Value::BulkString(expire)),
+                        ) if cmd.to_ascii_lowercase() == "px" => Command::Set(
+                            key.to_string(),
+                            value.to_string(),
+                            expire.parse::<u64>().ok(),
+                        ),
+                        (
+                            Some(Value::BulkString(key)),
+                            Some(Value::BulkString(value)),
+                            None,
+                            None,
+                        ) => Command::Set(key.to_string(), value.to_string(), None),
+                        (Some(Value::BulkString(_)), None, None, None) => {
                             Command::Error("invalid command, need value".to_string())
                         }
                         _ => Command::Error("invalid command, need key and value".to_string()),
@@ -200,6 +214,11 @@ fn readline(buf: &[u8]) -> Option<(&[u8], usize)> {
     None
 }
 
+pub struct ExpiringValue {
+    value: String,
+    expires_at: Option<SystemTime>,
+}
+
 #[tokio::main]
 async fn main() {
     println!("Starting server...");
@@ -212,7 +231,7 @@ async fn main() {
         }
     };
 
-    let db: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let db: Arc<Mutex<HashMap<String, ExpiringValue>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let conn = listener.accept().await;
@@ -237,7 +256,7 @@ async fn main() {
 
 pub async fn handle_client(
     stream: TcpStream,
-    db: Arc<Mutex<HashMap<String, String>>>,
+    db: Arc<Mutex<HashMap<String, ExpiringValue>>>,
 ) -> Result<()> {
     let mut conn = Connection::new(stream);
 
@@ -257,12 +276,38 @@ pub async fn handle_client(
                     Command::Ping(s) => {
                         Value::SimpleString(s.or_else(|| Some("PONG".to_string())).unwrap())
                     }
-                    Command::Set(k, v) => {
-                        db.lock().await.insert(k, v);
+                    Command::Set(k, v, Some(exp)) => {
+                        db.lock().await.insert(
+                            k,
+                            ExpiringValue {
+                                value: v,
+                                expires_at: Some(SystemTime::now() + Duration::from_millis(exp)),
+                            },
+                        );
+                        Value::SimpleString("OK".to_string())
+                    }
+                    Command::Set(k, v, None) => {
+                        db.lock().await.insert(
+                            k,
+                            ExpiringValue {
+                                value: v,
+                                expires_at: None,
+                            },
+                        );
                         Value::SimpleString("OK".to_string())
                     }
                     Command::Get(k) => match db.lock().await.get(&k) {
-                        Some(v) => Value::BulkString(v.to_string()),
+                        Some(ExpiringValue {
+                            value: val,
+                            expires_at: exp,
+                        }) => exp
+                            .and_then(|exp| match exp.duration_since(SystemTime::now()) {
+                                Ok(time) if time.as_millis() > 0 => {
+                                    Some(Value::BulkString(val.to_string()))
+                                }
+                                _ => Some(Value::Null),
+                            })
+                            .unwrap_or(Value::BulkString(val.to_string())),
                         None => Value::Null,
                     },
                     Command::Unknown(s) => Value::Error(s),
